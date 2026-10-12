@@ -18,7 +18,8 @@ jobs:
           fail=""
           probe() { # name url method
             for i in 1 2 3; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' -X "$3" --max-time 15 "$2" || echo 000)
+              if [ "$3" = HEAD ]; then flag=-I; else flag=; fi
+              code=$(curl -s $flag -o /dev/null -w '%{http_code}' --max-time 15 "$2") || code=000
               [ "$code" = "200" ] && return 0
               sleep 20
             done
