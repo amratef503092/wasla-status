@@ -1,0 +1,59 @@
+name: uptime
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+concurrency: uptime
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe
+        id: probe
+        run: |
+          fail=""
+          probe() { # name url method
+            for i in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -X "$3" --max-time 15 "$2" || echo 000)
+              [ "$code" = "200" ] && return 0
+              sleep 20
+            done
+            fail="$fail\n- $1: HTTP $code ($2)"
+          }
+          probe "API (DB + schema + Redis)" https://wasla.amratef.dev/healthz HEAD
+          probe "Website" https://wasla.amratef.dev/ GET
+          probe "Login page" https://wasla.amratef.dev/login GET
+          echo -e "fail<<EOF\n$fail\nEOF" >> "$GITHUB_OUTPUT"
+      - name: Open or close the incident issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAIL: ${{ steps.probe.outputs.fail }}
+        run: |
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label down --state open --json number --jq '.[0].number')
+          if [ -n "$(echo "$FAIL" | tr -d '[:space:]')" ]; then
+            if [ -z "$open" ]; then
+              gh label create down -R "$GITHUB_REPOSITORY" --color B60205 2>/dev/null || true
+              gh issue create -R "$GITHUB_REPOSITORY" --label down --assignee "${{ github.repository_owner }}" \
+                --title "🔴 Wasla is DOWN ($(date -u +%H:%MZ))" --body "$(printf 'Failed checks (3 tries each):\n%b\n\nI will close this issue automatically when everything is back.' "$FAIL")"
+            fi
+            exit 1
+          elif [ -n "$open" ]; then
+            gh issue close "$open" -R "$GITHUB_REPOSITORY" --comment "🟢 Back up at $(date -u +%H:%MZ)."
+          fi
+  keepalive:
+    # GitHub disables scheduled workflows after 60 days without repo activity.
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '*/5 * * * *'
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          day=$(date -u +%d); hm=$(date -u +%H%M)
+          if [ "$day" = "01" ] && [ "$hm" -lt "0010" ]; then
+            date -u +%F > last-keepalive.txt
+            git config user.name "wasla-status-bot"; git config user.email "actions@users.noreply.github.com"
+            git add last-keepalive.txt && git commit -m "keepalive $(date -u +%F)" && git push
+          fi
