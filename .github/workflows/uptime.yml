@@ -1,22 +1,31 @@
 name: uptime
+# GitHub runs schedules late (hours apart), so each run loops for ~5h50m,
+# checking every 5 minutes; new scheduled runs queue behind the current one.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
   issues: write
-concurrency: uptime
+concurrency:
+  group: uptime
+  cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 358
     steps:
-      - name: Probe
-        id: probe
+      - name: Probe every 5 minutes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          fail=""
+          end=$(( $(date +%s) + 350*60 ))
+          gh label create down -R "$REPO" --color B60205 2>/dev/null || true
           probe() { # name url method
+            local code
             for i in 1 2 3; do
               if [ "$3" = HEAD ]; then flag=-I; else flag=; fi
               code=$(curl -s $flag -o /dev/null -w '%{http_code}' --max-time 15 "$2") || code=000
@@ -25,35 +34,33 @@ jobs:
             done
             fail="$fail\n- $1: HTTP $code ($2)"
           }
-          probe "API (DB + schema + Redis)" https://wasla.amratef.dev/healthz HEAD
-          probe "Website" https://wasla.amratef.dev/ GET
-          probe "Login page" https://wasla.amratef.dev/login GET
-          echo -e "fail<<EOF\n$fail\nEOF" >> "$GITHUB_OUTPUT"
-      - name: Open or close the incident issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FAIL: ${{ steps.probe.outputs.fail }}
-        run: |
-          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label down --state open --json number --jq '.[0].number')
-          if [ -n "$(echo "$FAIL" | tr -d '[:space:]')" ]; then
-            if [ -z "$open" ]; then
-              gh label create down -R "$GITHUB_REPOSITORY" --color B60205 2>/dev/null || true
-              gh issue create -R "$GITHUB_REPOSITORY" --label down --assignee "${{ github.repository_owner }}" \
-                --title "🔴 Wasla is DOWN ($(date -u +%H:%MZ))" --body "$(printf 'Failed checks (3 tries each):\n%b\n\nI will close this issue automatically when everything is back.' "$FAIL")"
+          while [ "$(date +%s)" -lt "$end" ]; do
+            fail=""
+            probe "API (DB + schema + Redis)" https://wasla.amratef.dev/healthz HEAD
+            probe "Website" https://wasla.amratef.dev/ GET
+            probe "Login page" https://wasla.amratef.dev/login GET
+            open=$(gh issue list -R "$REPO" --label down --state open --json number --jq '.[0].number' || true)
+            if [ -n "$fail" ]; then
+              echo "$(date -u +%H:%M) DOWN:$fail"
+              if [ -z "$open" ]; then
+                gh issue create -R "$REPO" --label down --assignee "$OWNER" \
+                  --title "🔴 Wasla is DOWN ($(date -u +%H:%MZ))" \
+                  --body "$(printf 'Failed checks (3 tries each):%b\n\nThis issue closes itself when everything is back.' "$fail")" || true
+              fi
+            else
+              echo "$(date -u +%H:%M) ok"
+              [ -n "$open" ] && gh issue close "$open" -R "$REPO" --comment "🟢 Back up at $(date -u +%H:%MZ)." || true
             fi
-            exit 1
-          elif [ -n "$open" ]; then
-            gh issue close "$open" -R "$GITHUB_REPOSITORY" --comment "🟢 Back up at $(date -u +%H:%MZ)."
-          fi
+            sleep 300
+          done
   keepalive:
     # GitHub disables scheduled workflows after 60 days without repo activity.
     runs-on: ubuntu-latest
-    if: github.event.schedule == '*/5 * * * *'
     steps:
       - uses: actions/checkout@v4
       - run: |
-          day=$(date -u +%d); hm=$(date -u +%H%M)
-          if [ "$day" = "01" ] && [ "$hm" -lt "0010" ]; then
+          last=$(cat last-keepalive.txt 2>/dev/null || echo 1970-01-01)
+          if [ $(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 )) -ge 30 ]; then
             date -u +%F > last-keepalive.txt
             git config user.name "wasla-status-bot"; git config user.email "actions@users.noreply.github.com"
             git add last-keepalive.txt && git commit -m "keepalive $(date -u +%F)" && git push
